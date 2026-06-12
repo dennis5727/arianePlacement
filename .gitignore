@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.pyo
+KAGGLE_NOTEBOOK_SETUP.md

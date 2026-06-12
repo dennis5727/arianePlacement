@@ -23,12 +23,21 @@ or import:
 """
 
 import argparse
+import math
 import numpy as np
 
 
-def run_greedy(placedb, pnm=128, grid=224, verbose=True):
-    """Place ``pnm`` macros greedily on the wiremask. Returns (env, n_placed)."""
+def run_greedy(placedb, pnm=128, grid=224, regions=None, verbose=True):
+    """Place ``pnm`` macros greedily on the wiremask. Returns (env, n_placed, n_fallback).
+
+    regions (optional): dict {placement_index -> region label}. When a macro has
+    an assigned region, the greedy argmin is restricted to cells that are BOTH
+    legal AND inside that region (whole footprint must fit). If the region has no
+    legal cell left (occupied/too small), it falls back to an unconstrained legal
+    argmin and counts that as a fallback. n_fallback is how many macros fell back.
+    """
     from place_env.place_env import PlaceEnv
+    from region_constraint import region_mask
 
     env = PlaceEnv(placedb, placed_num_macro=pnm, grid=grid)
     G = env.grid
@@ -36,13 +45,28 @@ def run_greedy(placedb, pnm=128, grid=224, verbose=True):
 
     state = env.reset()
     n_placed = 0
+    n_fallback = 0
     for t in range(pnm):
         # Cost map for the macro about to be placed (node_id_to_name[t]).
         wiremask = env.get_net_img()                      # (G, G) raw cost
         posmask = state[mask_lo:mask_hi].reshape(G, G)    # 1 == illegal
+        legal = posmask == 0
+
+        # Optional region constraint for this macro.
+        label = None if regions is None else regions.get(t)
+        if label is not None:
+            name = env.node_name_list[t]
+            size_x = math.ceil(max(1, placedb.node_info[name]["x"] / env.ratio))
+            size_y = math.ceil(max(1, placedb.node_info[name]["y"] / env.ratio))
+            allowed = region_mask(label, G, size_x, size_y)
+            region_legal = legal & allowed
+            if region_legal.any():
+                legal = region_legal                      # honour the region
+            else:
+                n_fallback += 1                           # region full -> unconstrained
 
         cost = wiremask.copy()
-        cost[posmask == 1] = np.inf
+        cost[~legal] = np.inf
         if not np.isfinite(cost).any():
             print(f"[warn] macro {t} ({env.node_name_list[t]}): "
                   f"no legal cell remaining -- stopping early.")
@@ -54,13 +78,14 @@ def run_greedy(placedb, pnm=128, grid=224, verbose=True):
 
         if verbose and (t % 10 == 0 or t == pnm - 1):
             x, y = action // G, action % G
+            tag = f" [{label}]" if label is not None else ""
             print(f"  [{t:3d}] {env.node_name_list[t]:>22s} -> cell ({x:3d},{y:3d})"
-                  f"  min_wiremask={wiremask[x, y]:.3g}  reward={reward:.1f}")
+                  f"  min_wiremask={wiremask[x, y]:.3g}  reward={reward:.1f}{tag}")
 
         if done:
             break
 
-    return env, n_placed
+    return env, n_placed, n_fallback
 
 
 def count_overlaps(env):
@@ -90,13 +115,16 @@ def select_hard_macros(placedb, order="keep"):
 
 
 def greedy_place(benchmark="ariane", pnm=128, grid=224, save_fig=None, verbose=True,
-                 hard_only=False, hard_order="keep"):
+                 hard_only=False, hard_order="keep", regions=None):
     """End-to-end greedy placement. Returns a result dict with HPWL etc.
 
     hard_only=True restricts placement to the hard SRAM macros only (Mode B
     focus from the plan). It overwrites placedb.node_id_to_name with the hard
     list -- the env reads that attribute to decide what to place, so no env
     change is needed -- and sets pnm to the number of hard macros.
+
+    regions (optional): dict {placement_index -> region label} to constrain the
+    greedy placement (Phase 3+). See region_constraint.py.
     """
     from place_db import PlaceDB
     from comp_res import comp_res
@@ -110,7 +138,8 @@ def greedy_place(benchmark="ariane", pnm=128, grid=224, save_fig=None, verbose=T
         if verbose:
             print(f"[hard_only] placing {pnm} hard MACROs only (order={hard_order})")
 
-    env, n_placed = run_greedy(placedb, pnm=pnm, grid=grid, verbose=verbose)
+    env, n_placed, n_fallback = run_greedy(placedb, pnm=pnm, grid=grid,
+                                           regions=regions, verbose=verbose)
 
     hpwl, cost = comp_res(placedb, env.node_pos, env.ratio)
     overlaps = count_overlaps(env)
@@ -124,6 +153,8 @@ def greedy_place(benchmark="ariane", pnm=128, grid=224, save_fig=None, verbose=T
         print(f"grid           : {grid} x {grid}  (ratio 357/{grid} = {env.ratio:.4f})")
         print(f"macros placed  : {n_placed} / {pnm}")
         print(f"overlaps       : {overlaps}  ({'OK' if overlaps == 0 else 'BAD'})")
+        if regions is not None:
+            print(f"region fallback: {n_fallback} / {n_placed} macros")
         print(f"HPWL           : {hpwl:.6e}")
         print(f"prim cost      : {cost:.6e}")
         if save_fig:
@@ -134,6 +165,7 @@ def greedy_place(benchmark="ariane", pnm=128, grid=224, save_fig=None, verbose=T
         "hpwl": hpwl,
         "cost": cost,
         "placed": n_placed,
+        "fallback": n_fallback,
         "overlaps": overlaps,
         "grid": grid,
         "ratio": env.ratio,
