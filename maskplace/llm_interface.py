@@ -83,7 +83,8 @@ class DummyAdvisor:
         self.in_tokens = 0
         self.out_tokens = 0
 
-    def suggest(self, history_text, cur_hpwl, best_hpwl, prev_regions=None, diagnostics=""):
+    def suggest(self, history_text, cur_hpwl, best_hpwl, prev_regions=None,
+                feedback="", image_path=None):
         self.calls += 1
         k = max(1, int(len(self.macro_ids) * self.fraction))
         chosen = self.rng.sample(self.macro_ids, k)
@@ -110,20 +111,28 @@ class ClaudeAdvisor:
         self.out_tokens = 0
         self.cache_read_tokens = 0
 
-    def _build_user_msg(self, history_text, cur_hpwl, best_hpwl, prev_regions, diagnostics):
+    def _build_user_msg(self, history_text, cur_hpwl, best_hpwl, prev_regions, feedback,
+                        has_image=False):
+        image_hint = ""
+        if has_image:
+            image_hint = ("An image of the CURRENT layout is attached: red macros are "
+                          "constrained, blue are free; the dashed lines mark the 3x3 "
+                          "regions and numbers are macro ids. Use it to spot crowding "
+                          "and long wires.\n")
         return (
             "=== PLACEMENT HISTORY ===\n"
             f"{history_text}\n\n"
             "=== CURRENT REGION ASSIGNMENT ===\n"
             f"{_fmt_regions(prev_regions)}\n\n"
-            "=== LONG CONNECTIONS RIGHT NOW (strongly-linked macros far apart) ===\n"
-            f"{diagnostics or '(no diagnostics)'}\n\n"
+            "=== FEEDBACK ===\n"
+            f"{feedback or '(none)'}\n\n"
             "=== YOUR TASK ===\n"
-            f"Current HPWL: {cur_hpwl:.4e} (lower is better). Best so far: {best_hpwl:.4e}.\n"
-            "Pick the macros above that are far from their strong partners and put "
-            "each such pair/group into the SAME region so they are pulled together. "
+            f"Current best HPWL: {cur_hpwl:.4e} (lower is better).\n"
+            f"{image_hint}"
+            "Pick strongly-connected macros that are far apart and put each such "
+            "pair/group into the SAME region so they are pulled together. "
             "Assign a region ONLY to macros you want to move; OMIT every other macro "
-            "(it stays free and optimally placed). It is fine to move just a handful. "
+            "(it stays free and optimally placed). Move just a handful per step. "
             "Your JSON REPLACES the current assignment, so re-list any currently-"
             "assigned macro you still want held in place. "
             "If nothing looks worth changing, return an empty object {}.\n"
@@ -132,9 +141,19 @@ class ClaudeAdvisor:
             f"Valid regions: {', '.join(self.region_labels)}."
         )
 
-    def suggest(self, history_text, cur_hpwl, best_hpwl, prev_regions=None, diagnostics=""):
+    def suggest(self, history_text, cur_hpwl, best_hpwl, prev_regions=None,
+                feedback="", image_path=None):
         user_msg = self._build_user_msg(history_text, cur_hpwl, best_hpwl,
-                                        prev_regions or {}, diagnostics)
+                                        prev_regions or {}, feedback,
+                                        has_image=bool(image_path))
+        content = []
+        if image_path:
+            import base64
+            with open(image_path, "rb") as f:
+                b64 = base64.standard_b64encode(f.read()).decode()
+            content.append({"type": "image", "source": {"type": "base64",
+                            "media_type": "image/png", "data": b64}})
+        content.append({"type": "text", "text": user_msg})
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self.client.messages.create(
@@ -145,7 +164,7 @@ class ClaudeAdvisor:
                         {"type": "text", "text": self.summary,
                          "cache_control": {"type": "ephemeral"}},
                     ],
-                    messages=[{"role": "user", "content": user_msg}],
+                    messages=[{"role": "user", "content": content}],
                 )
                 self.calls += 1
                 u = resp.usage

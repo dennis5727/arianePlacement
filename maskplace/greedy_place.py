@@ -45,7 +45,7 @@ def run_greedy(placedb, pnm=128, grid=224, regions=None, verbose=True):
 
     state = env.reset()
     n_placed = 0
-    n_fallback = 0
+    fallbacks = []
     for t in range(pnm):
         # Cost map for the macro about to be placed (node_id_to_name[t]).
         wiremask = env.get_net_img()                      # (G, G) raw cost
@@ -63,7 +63,7 @@ def run_greedy(placedb, pnm=128, grid=224, regions=None, verbose=True):
             if region_legal.any():
                 legal = region_legal                      # honour the region
             else:
-                n_fallback += 1                           # region full -> unconstrained
+                fallbacks.append(t)                       # region full -> unconstrained
 
         cost = wiremask.copy()
         cost[~legal] = np.inf
@@ -85,7 +85,8 @@ def run_greedy(placedb, pnm=128, grid=224, regions=None, verbose=True):
         if done:
             break
 
-    return env, n_placed, n_fallback
+    env.fallback_ids = fallbacks          # which macros fell back (region full)
+    return env, n_placed, len(fallbacks)
 
 
 def count_overlaps(env):
@@ -101,21 +102,25 @@ def count_overlaps(env):
     return n
 
 
-def select_hard_macros(placedb, order="keep"):
+def select_hard_macros(placedb, order="area"):
     """Return the list of hard (is_hard==1) macro names.
 
-    order="keep" preserves their relative connectivity order from
-    node_id_to_name; order="area" sorts largest-first.
+    order="area"  -> largest-first, name as tiebreak (DETERMINISTIC; default).
+    order="name"  -> sorted by name (DETERMINISTIC).
+    order="keep"  -> MaskPlace's connectivity order from node_id_to_name
+                     (NOT deterministic: it uses a hash() tiebreak, so the
+                     baseline drifts run-to-run -- avoid for the final eval).
     """
     hard = [n for n in placedb.node_id_to_name if placedb.node_info[n].get("is_hard")]
     if order == "area":
-        hard.sort(key=lambda n: placedb.node_info[n]["x"] * placedb.node_info[n]["y"],
-                  reverse=True)
+        hard.sort(key=lambda n: (-placedb.node_info[n]["x"] * placedb.node_info[n]["y"], n))
+    elif order == "name":
+        hard.sort()
     return hard
 
 
 def greedy_place(benchmark="ariane", pnm=128, grid=224, save_fig=None, verbose=True,
-                 hard_only=False, hard_order="keep", regions=None):
+                 hard_only=False, hard_order="area", regions=None):
     """End-to-end greedy placement. Returns a result dict with HPWL etc.
 
     hard_only=True restricts placement to the hard SRAM macros only (Mode B
@@ -183,8 +188,8 @@ def _parse_args():
     p.add_argument("--quiet", action="store_true", help="suppress per-macro logging")
     p.add_argument("--hard-only", action="store_true",
                    help="place only the hard SRAM macros (overrides --pnm)")
-    p.add_argument("--hard-order", default="keep", choices=["keep", "area"],
-                   help="ordering of hard macros: keep connectivity order or sort by area")
+    p.add_argument("--hard-order", default="area", choices=["area", "name", "keep"],
+                   help="hard-macro order: area/name are deterministic; keep is MaskPlace's (drifts)")
     return p.parse_args()
 
 
