@@ -43,15 +43,73 @@ def _net_count(placedb, name):
 
 
 def connectivity_order(placedb, names):
-    """Deterministic hub-first order: most-connected, then largest, then name.
+    """STRONG baseline order = MaskPlace's topology (frontier-growth) order,
+    filtered to ``names``.
 
-    A deterministic stand-in for MaskPlace's topology order (which uses a
-    hash() tiebreak and so drifts run-to-run). This is the STRONG baseline.
+    This is the order that yields the ~8.6e4 ariane baseline. It is NOT a
+    degree sort -- a plain "most-connected-first" sort scatters connected
+    macros and scores like the weak order (~1.24e5). The real strength comes
+    from frontier growth (each macro added is the one most-connected to those
+    already placed), so connected macros end up consecutive. That traversal is
+    already computed at PlaceDB init and stored in placedb.node_id_to_name, so
+    we just filter it here.
+
+    Call this BEFORE mutating placedb.node_id_to_name (i.e. right after
+    PlaceDB(...)). Run-to-run it can drift ~3% because the underlying traversal
+    uses a hash() tiebreak; for a fixed order use topology_order() below.
     """
-    def key(n):
-        info = placedb.node_info[n]
-        return (-_net_count(placedb, n), -(info["x"] * info["y"]), n)
-    return sorted(names, key=key)
+    keep = set(names)
+    return [n for n in placedb.node_id_to_name if n in keep]
+
+
+def topology_order(placedb, names=None):
+    """Deterministic reproduction of MaskPlace's frontier-growth order.
+
+    Same selection rule as place_db.get_node_id_to_name_topology for ariane
+    (candidates*30000 + degree*1000 + area + tiebreak) but with a STABLE
+    md5 tiebreak instead of hash(), so it is identical every run. Traverses the
+    full node graph, then optionally filters to ``names``. Use this for a
+    reproducible strong baseline; sanity-check it matches connectivity_order().
+    """
+    import hashlib
+    from itertools import combinations
+
+    ni = placedb.node_info
+    n2net = placedb.node_to_net_dict
+
+    adjacency = {}
+    for net in placedb.net_info.values():
+        members = list(net["nodes"])
+        for a, b in combinations(members, 2):
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+
+    degree = {n: len(n2net.get(n, [])) for n in ni}
+    area = {n: ni[n]["x"] * ni[n]["y"] for n in ni}
+    tie = {n: int(hashlib.md5(n.encode()).hexdigest(), 16) % 10000 * 1e-6 for n in ni}
+
+    remaining = set(ni.keys())
+    order, cand = [], {}
+
+    def visit(node):
+        order.append(node)
+        remaining.discard(node)
+        cand.pop(node, None)
+        for nb in adjacency.get(node, ()):
+            if nb in remaining:
+                cand[nb] = cand.get(nb, 0) + 1
+
+    if "V" in remaining:
+        visit("V")
+    visit(max(remaining, key=lambda v: (degree[v], tie[v])))
+    while remaining:
+        visit(max(remaining, key=lambda v: cand.get(v, 0) * 30000 + degree[v] * 1000
+                  + area[v] + tie[v]))
+
+    if names is not None:
+        keep = set(names)
+        order = [n for n in order if n in keep]
+    return order
 
 
 def area_order(placedb, names):
