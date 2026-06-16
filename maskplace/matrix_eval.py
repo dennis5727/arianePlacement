@@ -25,73 +25,100 @@ import csv
 import os
 
 
-def _run_region(benchmark, base_names, grid, model, max_iters, patience, use_image, advisor, fig):
+def _run_region(benchmark, base_names, grid, model, max_iters, patience, use_image, advisor,
+                fig, verbose=True):
     from llm_guided_placement import run_llm_loop
     r = run_llm_loop(benchmark=benchmark, base_names=base_names, grid=grid, advisor=advisor,
                      use_image=use_image, model=model, max_iters=max_iters, patience=patience,
-                     save_best_fig=fig, verbose=False)
+                     save_best_fig=fig, verbose=verbose)
     return dict(hpwl=r["best_hpwl"], improvement=r["improvement_pct"],
                 calls=r["llm_calls"], out_tokens=r["out_tokens"], base_hpwl=r["baseline_hpwl"])
 
 
-def _run_ordering(placedb, base_names, grid, model, max_iters, patience, use_image, fig):
+def _run_ordering(placedb, base_names, grid, model, max_iters, patience, use_image, fig,
+                  verbose=True):
     from strong_search import llm_order_search
     r = llm_order_search(placedb, base_names, grid=grid, model=model, max_iters=max_iters,
-                         patience=patience, use_image=use_image, save_best_fig=fig, verbose=False)
+                         patience=patience, use_image=use_image, save_best_fig=fig, verbose=verbose)
     base = r["curve"][0]
     return dict(hpwl=r["best_hpwl"], improvement=100.0 * (base - r["best_hpwl"]) / base,
                 calls=r["calls"], out_tokens=r["out_tokens"], base_hpwl=base)
 
 
+def prepare_baselines(benchmark="ariane"):
+    """Build the two baseline orders ONCE. Returns (placedb, {name: order}).
+
+    Compute this in its own cell, then pass placedb + a single order to
+    run_baseline() so each baseline can be run/re-run in a separate cell.
+    """
+    from place_db import PlaceDB
+    from strong_search import hard_macro_names, area_order, connectivity_order
+    placedb = PlaceDB(benchmark)
+    hard = hard_macro_names(placedb)
+    # both orders captured up front, before any greedy run mutates node_id_to_name
+    orders = {
+        "weak (area)":   area_order(placedb, hard),
+        "strong (topo)": connectivity_order(placedb, hard),
+    }
+    return placedb, orders
+
+
+def run_baseline(placedb, bname, order, benchmark="ariane", grid=224,
+                 model="claude-sonnet-4-6", max_iters=8, patience=3, advisor="claude",
+                 n_random=12, outdir=".", verbose=True):
+    """Run the full set of rows for ONE baseline: greedy + random control +
+    {region, ordering} x {text, image}. Returns a list of row dicts."""
+    from strong_search import greedy_hpwl, random_restart_search
+    os.makedirs(outdir, exist_ok=True)
+
+    rows = []
+    if verbose:
+        print(f"\n===== baseline: {bname} ({len(order)} macros) =====")
+    _, base_hpwl, _ = greedy_hpwl(placedb, order, grid)
+    rows.append(dict(baseline=bname, method="greedy baseline", mode="-",
+                     hpwl=base_hpwl, improvement=0.0, calls=0, out_tokens=0))
+    if verbose:
+        print(f"  greedy baseline HPWL = {base_hpwl:.4e}")
+
+    # no-LLM control: random ordering search
+    rnd = random_restart_search(placedb, order, grid=grid, n_evals=n_random, verbose=False)
+    rows.append(dict(baseline=bname, method="random order search", mode="-",
+                     hpwl=rnd["best_hpwl"],
+                     improvement=100.0 * (base_hpwl - rnd["best_hpwl"]) / base_hpwl,
+                     calls=0, out_tokens=0))
+    if verbose:
+        print(f"  random search   HPWL = {rnd['best_hpwl']:.4e}")
+
+    tag = os.path.join(outdir, bname.split()[0])  # 'weak' / 'strong'
+    for mode, use_image in [("text", False), ("image", True)]:
+        if verbose:
+            print(f"\n--- LLM region [{mode}] on {bname} ---")
+        r = _run_region(benchmark, order, grid, model, max_iters, patience, use_image,
+                        advisor, f"{tag}_region_{mode}.png", verbose=verbose)
+        rows.append(dict(baseline=bname, method="LLM region", mode=mode, **r))
+        if verbose:
+            print(f"  => LLM region {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    for mode, use_image in [("text", False), ("image", True)]:
+        if verbose:
+            print(f"\n--- LLM ordering [{mode}] on {bname} ---")
+        r = _run_ordering(placedb, order, grid, model, max_iters, patience, use_image,
+                          f"{tag}_order_{mode}.png", verbose=verbose)
+        rows.append(dict(baseline=bname, method="LLM ordering", mode=mode, **r))
+        if verbose:
+            print(f"  => LLM order  {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    return rows
+
+
 def evaluate_matrix(benchmark="ariane", grid=224, model="claude-sonnet-4-6",
                     max_iters=8, patience=3, advisor="claude", n_random=12,
                     outdir=".", verbose=True):
-    from place_db import PlaceDB
-    from strong_search import (hard_macro_names, area_order, connectivity_order,
-                               greedy_hpwl, random_restart_search)
-
-    os.makedirs(outdir, exist_ok=True)
-    placedb = PlaceDB(benchmark)
-    hard = hard_macro_names(placedb)
-    # both orders computed up front, before any greedy run mutates node_id_to_name
-    baselines = {
-        "weak (area)":     area_order(placedb, hard),
-        "strong (topo)":   connectivity_order(placedb, hard),
-    }
-
+    """Run BOTH baselines in one call (convenience wrapper around run_baseline)."""
+    placedb, orders = prepare_baselines(benchmark)
     rows = []
-    for bname, order in baselines.items():
-        if verbose:
-            print(f"\n===== baseline: {bname} ({len(order)} macros) =====")
-        _, base_hpwl, _ = greedy_hpwl(placedb, order, grid)
-        rows.append(dict(baseline=bname, method="greedy baseline", mode="-",
-                         hpwl=base_hpwl, improvement=0.0, calls=0, out_tokens=0))
-        if verbose:
-            print(f"  greedy baseline HPWL = {base_hpwl:.4e}")
-
-        # no-LLM control: random ordering search
-        rnd = random_restart_search(placedb, order, grid=grid, n_evals=n_random, verbose=False)
-        rows.append(dict(baseline=bname, method="random order search", mode="-",
-                         hpwl=rnd["best_hpwl"],
-                         improvement=100.0 * (base_hpwl - rnd["best_hpwl"]) / base_hpwl,
-                         calls=0, out_tokens=0))
-        if verbose:
-            print(f"  random search   HPWL = {rnd['best_hpwl']:.4e}")
-
-        tag = os.path.join(outdir, bname.split()[0])  # 'weak' / 'strong'
-        for mode, use_image in [("text", False), ("image", True)]:
-            r = _run_region(benchmark, order, grid, model, max_iters, patience, use_image,
-                            advisor, f"{tag}_region_{mode}.png")
-            rows.append(dict(baseline=bname, method="LLM region", mode=mode, **r))
-            if verbose:
-                print(f"  LLM region {mode:<5} HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
-        for mode, use_image in [("text", False), ("image", True)]:
-            r = _run_ordering(placedb, order, grid, model, max_iters, patience, use_image,
-                              f"{tag}_order_{mode}.png")
-            rows.append(dict(baseline=bname, method="LLM ordering", mode=mode, **r))
-            if verbose:
-                print(f"  LLM order  {mode:<5} HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
-
+    for bname, order in orders.items():
+        rows += run_baseline(placedb, bname, order, benchmark=benchmark, grid=grid,
+                             model=model, max_iters=max_iters, patience=patience,
+                             advisor=advisor, n_random=n_random, outdir=outdir, verbose=verbose)
     return rows
 
 
