@@ -55,8 +55,15 @@ def _build_feedback(env, names, conns, last_outcome):
 
 
 def run_llm_loop(benchmark="ariane", pnm=None, grid=224, hard_only=True, hard_order="area",
-                 max_iters=15, patience=3, advisor="dummy", use_image=False,
+                 base_names=None, max_iters=15, patience=3, advisor="dummy", use_image=False,
                  model="claude-sonnet-4-6", save_best_fig="llm_best.png", verbose=True):
+    """LLM region-guidance loop.
+
+    base_names (optional): an explicit macro placement order (list of names) to
+    use as the baseline -- e.g. the strong topology order or the weak area order.
+    When given it overrides hard_only/hard_order, so the SAME region method can be
+    tested on either baseline. M-ids in the prompt follow this order.
+    """
     from place_db import PlaceDB
     from comp_res import comp_res
     from greedy_place import run_greedy, count_overlaps, select_hard_macros
@@ -66,7 +73,9 @@ def run_llm_loop(benchmark="ariane", pnm=None, grid=224, hard_only=True, hard_or
     from llm_interface import DummyAdvisor, ClaudeAdvisor
 
     placedb = PlaceDB(benchmark)
-    if hard_only:
+    if base_names is not None:
+        placedb.node_id_to_name = list(base_names)
+    elif hard_only:
         placedb.node_id_to_name = select_hard_macros(placedb, order=hard_order)
     full = len(placedb.node_id_to_name)
     pnm = full if pnm is None else min(pnm, full)
