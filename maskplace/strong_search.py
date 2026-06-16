@@ -239,7 +239,7 @@ class OrderingAdvisor:
     )
 
     def __init__(self, summary, n, model="claude-sonnet-4-6", max_tokens=4000,
-                 max_retries=2, api_key=None):
+                 max_retries=2, api_key=None, temperature=0.7):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.summary = summary
@@ -247,28 +247,38 @@ class OrderingAdvisor:
         self.model = model
         self.max_tokens = max_tokens
         self.max_retries = max_retries
+        self.temperature = temperature
         self.calls = self.in_tokens = self.out_tokens = self.cache_read_tokens = 0
 
-    def _user_msg(self, best_hpwl, feedback, has_image):
+    def _user_msg(self, best_hpwl, best_order, history_text, feedback, has_image):
         img = ""
         if has_image:
             img = ("An image of the CURRENT best layout is attached; numbers are macro ids. "
                    "Use it to see which connected macros ended up far apart.\n")
         return (
             f"There are {self.n} macros with ids M0..M{self.n - 1} (see summary).\n\n"
+            "=== ORDERS TRIED SO FAR ===\n"
+            f"{history_text}\n\n"
+            "=== CURRENT BEST ORDER (your anchor) ===\n"
+            f"{json.dumps(best_order)}\n"
+            "This exact order produced the best HPWL so far. Start from THIS order and make a "
+            "TARGETED change -- pull one hub macro earlier, or move a tightly-connected group so "
+            "its members become early and consecutive. Keep most of the order intact; do not "
+            "reshuffle everything.\n\n"
             "=== CURRENT BEST LAYOUT FEEDBACK ===\n"
             f"{feedback}\n\n"
             "=== YOUR TASK ===\n"
             f"Current best HPWL: {best_hpwl:.4e} (lower is better).\n"
             f"{img}"
-            "Propose a NEW placement order (a permutation of ALL ids 0..%d) that you expect "
-            "to lower HPWL: put hub macros and tightly-connected groups early and consecutive, "
-            "so the greedy pulls them together. Think briefly, then output ONLY a JSON array of "
+            "Propose a MODIFIED placement order (a permutation of ALL ids 0..%d) that you expect "
+            "to lower HPWL. Do NOT repeat any order already tried above -- if a change was "
+            "rejected, try a DIFFERENT one. Think briefly, then output ONLY a JSON array of "
             "all ids in placement order, e.g. [3,17,2,...]. The array MUST contain every id "
             "exactly once." % (self.n - 1)
         )
 
-    def suggest(self, best_hpwl, feedback="", image_path=None):
+    def suggest(self, best_hpwl, best_order, history_text="(no attempts yet)",
+                feedback="", image_path=None):
         content = []
         if image_path:
             import base64
@@ -276,11 +286,13 @@ class OrderingAdvisor:
                 b64 = base64.standard_b64encode(f.read()).decode()
             content.append({"type": "image", "source": {"type": "base64",
                             "media_type": "image/png", "data": b64}})
-        content.append({"type": "text", "text": self._user_msg(best_hpwl, feedback or "(none)", bool(image_path))})
+        content.append({"type": "text", "text": self._user_msg(
+            best_hpwl, list(best_order), history_text, feedback or "(none)", bool(image_path))})
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self.client.messages.create(
                     model=self.model, max_tokens=self.max_tokens,
+                    temperature=self.temperature,
                     system=[{"type": "text", "text": self.SYSTEM},
                             {"type": "text", "text": self.summary,
                              "cache_control": {"type": "ephemeral"}}],
@@ -342,31 +354,55 @@ def llm_order_search(placedb, canonical_names, grid=224, model="claude-sonnet-4-
         print(f"iter 0 (connectivity strong baseline): HPWL={best_hpwl:.4e} "
               f"overlaps={count_overlaps(best_env)}")
 
-    last = None
+    # history of every distinct order evaluated, plus a set of all proposed orders
+    # (incl. duplicates) for dedup so we never re-run the greedy on the same perm.
+    attempts = [(best_hpwl, True, "baseline")]   # (hpwl, accepted, note)
+    tried = {tuple(best)}
+
+    def history_text():
+        lines = []
+        for k, (h, acc, note) in enumerate(attempts):
+            tag = note if note else ("accepted, NEW BEST" if acc else "rejected")
+            lines.append(f"attempt {k}: HPWL={h:.4e} ({tag})")
+        lines.append(f"Best so far: HPWL={best_hpwl:.4e}")
+        return "\n".join(lines)
+
     no_improve = 0
     for it in range(1, max_iters + 1):
         fb = "LONG CONNECTIONS RIGHT NOW: " + long_links(best_env, id_of, links)
-        if last == "accepted":
-            fb += "\nYour last order IMPROVED HPWL and was kept. Refine it further."
-        elif last == "rejected":
-            fb += "\nYour last order did NOT improve HPWL and was reverted. Try a different grouping."
         image_path = None
         if use_image:
             from visualize import render_placement
             image_path = render_placement(best_env, grid, names=canonical_names, regions={},
                                            path="strong_view.png")
-        proposed = adv.suggest(best_hpwl, feedback=fb, image_path=image_path)
+        proposed = adv.suggest(best_hpwl, best, history_text(), feedback=fb, image_path=image_path)
         if proposed is None:
             if verbose:
                 print(f"iter {it:2d}: no proposal -> stop")
             break
-        perm = repair_perm(proposed, n, list(range(n)))
+        # missing/junk ids fall back to the CURRENT BEST order, so an omitted tail
+        # keeps the anchor instead of reverting to the canonical baseline.
+        perm = repair_perm(proposed, n, best)
+        key = tuple(perm)
+        if key in tried:                       # dedup: don't re-evaluate a known order
+            no_improve += 1
+            attempts.append((best_hpwl, False, "duplicate of an earlier order (skipped)"))
+            if verbose:
+                print(f"iter {it:2d}: proposed an already-tried order -> skipped "
+                      f"(no_improve={no_improve})")
+            if no_improve >= patience:
+                if verbose:
+                    print(f"early stop: no improvement for {patience} iterations")
+                break
+            continue
+        tried.add(key)
         env, h, fbk = greedy_hpwl(placedb, [canonical_names[i] for i in perm], grid)
         accepted = h < best_hpwl
         if accepted:
-            best, best_hpwl, best_env, last, no_improve = perm, h, env, "accepted", 0
+            best, best_hpwl, best_env, no_improve = perm, h, env, 0
         else:
-            last, no_improve = "rejected", no_improve + 1
+            no_improve += 1
+        attempts.append((h, accepted, ""))
         curve.append(best_hpwl)
         if verbose:
             print(f"iter {it:2d}: HPWL={h:.4e} ({'ACCEPT' if accepted else 'reject'})  "

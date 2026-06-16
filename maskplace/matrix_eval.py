@@ -65,9 +65,13 @@ def prepare_baselines(benchmark="ariane"):
 
 def run_baseline(placedb, bname, order, benchmark="ariane", grid=224,
                  model="claude-sonnet-4-6", max_iters=8, patience=3, advisor="claude",
-                 n_random=12, outdir=".", verbose=True):
+                 n_random=12, outdir=".", verbose=True, do_region=True):
     """Run the full set of rows for ONE baseline: greedy + random control +
-    {region, ordering} x {text, image}. Returns a list of row dicts."""
+    {region, ordering} x {text, image}. Returns a list of row dicts.
+
+    do_region=False skips the LLM region runs (text+image), e.g. to save API
+    cost on a baseline where only the ordering result matters.
+    """
     from strong_search import greedy_hpwl, random_restart_search
     os.makedirs(outdir, exist_ok=True)
 
@@ -90,14 +94,17 @@ def run_baseline(placedb, bname, order, benchmark="ariane", grid=224,
         print(f"  random search   HPWL = {rnd['best_hpwl']:.4e}")
 
     tag = os.path.join(outdir, bname.split()[0])  # 'weak' / 'strong'
-    for mode, use_image in [("text", False), ("image", True)]:
-        if verbose:
-            print(f"\n--- LLM region [{mode}] on {bname} ---")
-        r = _run_region(benchmark, order, grid, model, max_iters, patience, use_image,
-                        advisor, f"{tag}_region_{mode}.png", verbose=verbose)
-        rows.append(dict(baseline=bname, method="LLM region", mode=mode, **r))
-        if verbose:
-            print(f"  => LLM region {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    if do_region:
+        for mode, use_image in [("text", False), ("image", True)]:
+            if verbose:
+                print(f"\n--- LLM region [{mode}] on {bname} ---")
+            r = _run_region(benchmark, order, grid, model, max_iters, patience, use_image,
+                            advisor, f"{tag}_region_{mode}.png", verbose=verbose)
+            rows.append(dict(baseline=bname, method="LLM region", mode=mode, **r))
+            if verbose:
+                print(f"  => LLM region {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    elif verbose:
+        print(f"\n--- LLM region runs SKIPPED on {bname} (do_region=False) ---")
     for mode, use_image in [("text", False), ("image", True)]:
         if verbose:
             print(f"\n--- LLM ordering [{mode}] on {bname} ---")
