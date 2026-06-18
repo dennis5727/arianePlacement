@@ -116,6 +116,64 @@ def run_baseline(placedb, bname, order, benchmark="ariane", grid=224,
     return rows
 
 
+# --------------------------------------------------------------------------- #
+# Single-method runners (one per notebook cell, so each can be run on its own).
+# All take placedb + a single baseline order. greedy/random are FREE (no API);
+# region/ordering are PAID (2 LLM runs each: text + image).
+# --------------------------------------------------------------------------- #
+def run_random_control(placedb, bname, order, grid=224, n_random=12, verbose=True):
+    """FREE: greedy baseline + no-LLM random-order search for ONE baseline."""
+    from strong_search import greedy_hpwl, random_restart_search
+    rows = []
+    _, base_hpwl, _ = greedy_hpwl(placedb, order, grid)
+    rows.append(dict(baseline=bname, method="greedy baseline", mode="-",
+                     hpwl=base_hpwl, improvement=0.0, calls=0, out_tokens=0))
+    rnd = random_restart_search(placedb, order, grid=grid, n_evals=n_random, verbose=False)
+    rows.append(dict(baseline=bname, method="random order search", mode="-",
+                     hpwl=rnd["best_hpwl"],
+                     improvement=100.0 * (base_hpwl - rnd["best_hpwl"]) / base_hpwl,
+                     calls=0, out_tokens=0))
+    if verbose:
+        print(f"[{bname}] greedy baseline = {base_hpwl:.4e} | "
+              f"random search = {rnd['best_hpwl']:.4e} ({rows[-1]['improvement']:+.2f}%)")
+    return rows
+
+
+def run_region(placedb, bname, order, benchmark="ariane", grid=224,
+               model="claude-sonnet-4-6", max_iters=8, patience=3, advisor="claude",
+               outdir=".", verbose=True):
+    """PAID: LLM region guidance (text + image) for ONE baseline."""
+    os.makedirs(outdir, exist_ok=True)
+    tag = os.path.join(outdir, bname.split()[0])  # 'weak' / 'strong'
+    rows = []
+    for mode, use_image in [("text", False), ("image", True)]:
+        if verbose:
+            print(f"\n--- LLM region [{mode}] on {bname} ---")
+        r = _run_region(benchmark, order, grid, model, max_iters, patience, use_image,
+                        advisor, f"{tag}_region_{mode}.png", verbose=verbose)
+        rows.append(dict(baseline=bname, method="LLM region", mode=mode, **r))
+        if verbose:
+            print(f"  => LLM region {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    return rows
+
+
+def run_ordering(placedb, bname, order, grid=224, model="claude-sonnet-4-6",
+                 max_iters=8, patience=3, outdir=".", verbose=True):
+    """PAID: LLM placement-order search (text + image) for ONE baseline."""
+    os.makedirs(outdir, exist_ok=True)
+    tag = os.path.join(outdir, bname.split()[0])  # 'weak' / 'strong'
+    rows = []
+    for mode, use_image in [("text", False), ("image", True)]:
+        if verbose:
+            print(f"\n--- LLM ordering [{mode}] on {bname} ---")
+        r = _run_ordering(placedb, order, grid, model, max_iters, patience, use_image,
+                          f"{tag}_order_{mode}.png", verbose=verbose)
+        rows.append(dict(baseline=bname, method="LLM ordering", mode=mode, **r))
+        if verbose:
+            print(f"  => LLM order  {mode:<5} best HPWL = {r['hpwl']:.4e} ({r['improvement']:+.2f}%)")
+    return rows
+
+
 def evaluate_matrix(benchmark="ariane", grid=224, model="claude-sonnet-4-6",
                     max_iters=8, patience=3, advisor="claude", n_random=12,
                     outdir=".", verbose=True):
