@@ -59,15 +59,28 @@ parser.add_argument('--max_episodes', type=int, default=100000,
                     help='cap on training episodes (use a small value for a smoke test)')
 parser.add_argument('--outdir', type=str, default='.',
                     help='where to write best-HPWL csv, best model and figures')
+parser.add_argument('--hard_only', action='store_true', default=False,
+                    help='place ONLY is_hard macros, in topology order (matches the '
+                         'greedy/LLM study; e.g. ariane = 133 hard macros out of 932 nodes)')
 args = parser.parse_args()
 writer = SummaryWriter('./tb_log')
 
 benchmark = args.benchmark
 placedb = PlaceDB(benchmark)
 grid = 224
+# --- hard-only: restrict to is_hard macros, keeping PlaceDB's topology order.
+# This is exactly the set/order the greedy "strong (topo)" baseline uses
+# (strong_search.connectivity_order filters the same node_id_to_name), so the
+# RL result is comparable to the greedy/LLM numbers. ---------------------- #
+if args.hard_only:
+    hard = [n for n in placedb.node_id_to_name if placedb.node_info[n].get("is_hard")]
+    assert hard, "no is_hard macros for benchmark '{}'".format(benchmark)
+    placedb.node_id_to_name = hard
+    print("hard_only: placing {} hard macros (out of {} nodes)".format(len(hard), placedb.node_cnt))
 placed_num_macro = args.pnm
-if args.pnm > placedb.node_cnt:
-    placed_num_macro = placedb.node_cnt
+# clamp against the (possibly hard-filtered) order length, not node_cnt
+if args.pnm > len(placedb.node_id_to_name):
+    placed_num_macro = len(placedb.node_id_to_name)
     args.pnm = placed_num_macro
 env = gym.make('place_env-v0', placedb = placedb, placed_num_macro = placed_num_macro, grid = grid).unwrapped
 
