@@ -239,7 +239,7 @@ class OrderingAdvisor:
     )
 
     def __init__(self, summary, n, model="claude-sonnet-4-6", max_tokens=4000,
-                 max_retries=2, api_key=None, temperature=0.7):
+                 max_retries=2, api_key=None, temperature=None):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.summary = summary
@@ -288,15 +288,18 @@ class OrderingAdvisor:
                             "media_type": "image/png", "data": b64}})
         content.append({"type": "text", "text": self._user_msg(
             best_hpwl, list(best_order), history_text, feedback or "(none)", bool(image_path))})
+        # temperature is deprecated on some models (e.g. claude-opus-4-8), so only
+        # send it when explicitly set; omitting it uses the model default.
+        kwargs = {} if self.temperature is None else {"temperature": self.temperature}
         for attempt in range(self.max_retries + 1):
             try:
                 resp = self.client.messages.create(
                     model=self.model, max_tokens=self.max_tokens,
-                    temperature=self.temperature,
                     system=[{"type": "text", "text": self.SYSTEM},
                             {"type": "text", "text": self.summary,
                              "cache_control": {"type": "ephemeral"}}],
                     messages=[{"role": "user", "content": content}],
+                    **kwargs,
                 )
                 self.calls += 1
                 u = resp.usage
