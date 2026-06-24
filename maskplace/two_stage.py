@@ -135,13 +135,138 @@ def soft_fill(placedb, env, grid, iters=8, init="median"):
 
 
 def two_stage_hpwl(placedb, hard_order, grid=224, soft_iters=8):
-    """Place 133 hard (given order) + fill 799 soft; return (full932_hpwl, env)."""
+    """Place 133 hard (given order) + fill 799 soft; return (full932_hpwl, env).
+
+    NOTE: the soft stage minimizes wirelength only -- it does NOT avoid overlaps,
+    so this env has the 799 soft clusters stacked on top of each other and the hard
+    macros (~94% grid density). The HPWL is therefore an OPTIMISTIC, NON-legal
+    number: connected nodes are free to pile up. For a real, overlap-free 932 HPWL
+    use two_stage_legal_hpwl below.
+    """
     from comp_res import comp_res
 
     env, _hard_hpwl, _fb = greedy_hpwl(placedb, hard_order, grid)
     soft_fill(placedb, env, grid, iters=soft_iters)
     hpwl, _cost = comp_res(placedb, env.node_pos, env.ratio)
     return hpwl, env
+
+
+# --------------------------------------------------------------------------- #
+# legalization: make ALL 932 macros overlap-free and inside the canvas
+# --------------------------------------------------------------------------- #
+def _rect_free(occ, x, y, sx, sy, g):
+    """True if the sx-by-sy footprint at corner (x, y) is in-grid and unoccupied."""
+    if x < 0 or y < 0 or x + sx > g or y + sy > g:
+        return False
+    return not occ[x:x + sx, y:y + sy].any()
+
+
+def _nearest_free(occ, tx, ty, sx, sy, g):
+    """Nearest (Chebyshev-ring) free corner to target (tx, ty); None if grid is full."""
+    if _rect_free(occ, tx, ty, sx, sy, g):
+        return tx, ty
+    for r in range(1, g):
+        x0, x1, y0, y1 = tx - r, tx + r, ty - r, ty + r
+        for x in range(x0, x1 + 1):                       # top & bottom edges of ring
+            if _rect_free(occ, x, y0, sx, sy, g):
+                return x, y0
+            if _rect_free(occ, x, y1, sx, sy, g):
+                return x, y1
+        for y in range(y0 + 1, y1):                       # left & right edges of ring
+            if _rect_free(occ, x0, y, sx, sy, g):
+                return x0, y
+            if _rect_free(occ, x1, y, sx, sy, g):
+                return x1, y
+    return None
+
+
+def legalize_placement(placedb, env, grid, refine=2):
+    """Remove ALL overlaps and keep every macro inside the canvas, on a refined grid.
+
+    soft_fill leaves the 799 soft clusters massively overlapping. This pass makes
+    the whole 932-macro layout legal. It re-expresses the layout on a ``refine`` x
+    finer grid -- which undoes the coarse-grid ceil() area inflation that made the
+    224 grid look ~94% full when the true canvas is only ~78% full -- then:
+
+      * the 133 hard macros keep their legal greedy positions (scaled by ``refine``,
+        an exact remap because the footprints just scale), and
+      * each soft cluster is snapped to the NEAREST free spot to its soft_fill
+        target (largest-first Tetris fill), so it stays near its wirelength-optimal
+        location while overlaps are removed.
+
+    Mutates env.node_pos to the refined integer cells (and env.ratio) and returns
+    (env, ratio_fine, unplaced_names). Score with comp_res(placedb, env.node_pos,
+    ratio_fine). With refine=2 all 932 ariane macros fit with zero overlaps.
+    """
+    g = grid * refine
+    ratio_f = placedb.max_height / g
+    occ = np.zeros((g, g), dtype=bool)
+    new_pos = {}
+    hard = {n for n in placedb.node_info if placedb.node_info[n].get("is_hard")}
+
+    # hard macros: exact scale of the already-legal greedy positions
+    for name, (x, y, sx, sy) in env.node_pos.items():
+        if name in hard:
+            X, Y, SX, SY = x * refine, y * refine, sx * refine, sy * refine
+            occ[X:X + SX, Y:Y + SY] = True
+            new_pos[name] = (X, Y, SX, SY)
+
+    def fsize(name):
+        return (math.ceil(max(1, placedb.node_info[name]["x"] / ratio_f)),
+                math.ceil(max(1, placedb.node_info[name]["y"] / ratio_f)))
+
+    # largest-first packs tighter and leaves small holes for the small clusters
+    soft = sorted((n for n in env.node_pos if n not in hard),
+                  key=lambda n: -(fsize(n)[0] * fsize(n)[1]))
+    unplaced = []
+    for name in soft:
+        sx, sy = fsize(name)
+        tx = min(max(int(round(env.node_pos[name][0] * refine)), 0), g - sx)
+        ty = min(max(int(round(env.node_pos[name][1] * refine)), 0), g - sy)
+        spot = _nearest_free(occ, tx, ty, sx, sy, g)
+        if spot is None:                                  # grid genuinely full
+            unplaced.append(name)
+            continue
+        X, Y = spot
+        occ[X:X + sx, Y:Y + sy] = True
+        new_pos[name] = (X, Y, sx, sy)
+
+    env.node_pos = new_pos
+    env.ratio = ratio_f               # keep env self-consistent for comp_res
+    return env, ratio_f, unplaced
+
+
+def two_stage_legal_hpwl(placedb, hard_order, grid=224, soft_iters=8, refine=2):
+    """Full LEGAL 932 placement: hard greedy + soft fill + legalization.
+
+    Returns (legal_bbox_hpwl, legal_mst_cost, env, ratio_fine, n_unplaced). Unlike
+    two_stage_hpwl this layout has ZERO overlaps and every macro inside the canvas,
+    so the numbers are real, comparable -- and necessarily HIGHER than the
+    overlapping one, because connected clusters can no longer pile on the same spot.
+
+    Two wirelength numbers are returned because they match different baselines:
+      * bbox_hpwl -- half-perimeter bounding box (what comp_res calls hpwl), and
+      * mst_cost  -- the minimum-spanning-tree estimate (comp_res's prim cost),
+        which is the metric MaskPlace's paper Table 2 reports.
+    """
+    from comp_res import comp_res
+
+    env, _hard_hpwl, _fb = greedy_hpwl(placedb, hard_order, grid)
+    soft_fill(placedb, env, grid, iters=soft_iters)
+    env, ratio_f, unplaced = legalize_placement(placedb, env, grid, refine=refine)
+    bbox_hpwl, mst_cost = comp_res(placedb, env.node_pos, ratio_f)
+    return bbox_hpwl, mst_cost, env, ratio_f, len(unplaced)
+
+
+def legal_scores(placedb, hard_order, grid=224, soft_iters=8, refine=2):
+    """Thin wrapper over two_stage_legal_hpwl for the trade-off harness.
+
+    Returns dict(bbox, mst, n_unplaced, grid_fine) -- the legal (zero-overlap)
+    wirelength of a hard order, scored apples-to-apples with MaskPlace.
+    """
+    bbox, mst, _env, _ratio_f, n_unplaced = two_stage_legal_hpwl(
+        placedb, hard_order, grid=grid, soft_iters=soft_iters, refine=refine)
+    return {"bbox": bbox, "mst": mst, "n_unplaced": n_unplaced, "grid_fine": grid * refine}
 
 
 # --------------------------------------------------------------------------- #
