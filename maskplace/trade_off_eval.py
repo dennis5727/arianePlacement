@@ -64,6 +64,25 @@ def usd_cost(model, in_tokens, out_tokens, cache_read_tokens=0):
             + cache_read_tokens * p["cache_read"]) / 1e6
 
 
+def verify_legal(env, grid_fine):
+    """Sanity-check a placed env: count overlapping macro pairs and out-of-canvas macros.
+
+    Returns dict(macros, overlaps, out_of_canvas). A legal layout has overlaps=0,
+    out_of_canvas=0, and macros=932 for ariane.
+    """
+    rects = list(env.node_pos.values())
+    overlaps = 0
+    for i in range(len(rects)):
+        xi, yi, sxi, syi = rects[i]
+        for j in range(i + 1, len(rects)):
+            xj, yj, sxj, syj = rects[j]
+            if xi < xj + sxj and xj < xi + sxi and yi < yj + syj and yj < yi + syi:
+                overlaps += 1
+    oob = sum(1 for (x, y, sx, sy) in env.node_pos.values()
+              if x < 0 or y < 0 or x + sx > grid_fine or y + sy > grid_fine)
+    return {"macros": len(env.node_pos), "overlaps": overlaps, "out_of_canvas": oob}
+
+
 # --------------------------------------------------------------------------- #
 # proxy-fidelity: does the fast overlapping HPWL track the LEGAL HPWL?
 # --------------------------------------------------------------------------- #
