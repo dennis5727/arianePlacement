@@ -158,18 +158,22 @@ def evaluate_trade_off(benchmark="ariane", model="claude-sonnet-4-6", grid=224, 
         print(f"strong baseline   legal bbox={rows[-1]['legal_bbox']:.4e} "
               f"MST={rows[-1]['legal_mst']:.4e}")
 
-    # no-LLM random-order control (free)
+    # no-LLM random-order control (free), optimizing the LEGAL layout in-loop
     t = time.time()
     rc = ts.random_order_control(placedb, strong, grid=grid, n_evals=n_random,
-                                 soft_iters=soft_iters, verbose=verbose)
+                                 soft_iters=soft_iters, verbose=verbose,
+                                 legal=True, refine=refine)
     rows.append(_legal_row("random control", placedb, strong, rc["best_perm"],
                            grid, refine, soft_iters, time.time() - t))
 
     if run_llm:
+        # LLM searches optimize the LEGAL (zero-overlap) layout directly, so best_perm
+        # is a real legal 932-macro placement -- the result comparable to MaskPlace.
         t = time.time()
         rf = ts.llm_full_order_search(placedb, strong, grid=grid, model=model,
                                       max_iters=max_iters, patience=patience,
-                                      soft_iters=soft_iters, verbose=verbose)
+                                      soft_iters=soft_iters, verbose=verbose,
+                                      legal=True, refine=refine)
         rows.append(_legal_row("LLM full-order", placedb, strong, rf["best_perm"],
                                grid, refine, soft_iters, time.time() - t, model=model,
                                calls=rf["calls"], in_tok=rf["in_tokens"],
@@ -178,7 +182,8 @@ def evaluate_trade_off(benchmark="ariane", model="claude-sonnet-4-6", grid=224, 
         t = time.time()
         rp = ts.llm_prefix_search(placedb, strong, grid=grid, model=model,
                                   max_iters=max_iters, patience=patience, k=prefix_k,
-                                  soft_iters=soft_iters, verbose=verbose)
+                                  soft_iters=soft_iters, verbose=verbose,
+                                  legal=True, refine=refine)
         rows.append(_legal_row("LLM prefix", placedb, strong, rp["best_perm"],
                                grid, refine, soft_iters, time.time() - t, model=model,
                                calls=rp["calls"], in_tok=rp["in_tokens"],

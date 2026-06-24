@@ -273,23 +273,27 @@ def legal_scores(placedb, hard_order, grid=224, soft_iters=8, refine=2):
 # no-LLM control: random hill-climb over the HARD order, scored on full 932
 # --------------------------------------------------------------------------- #
 def random_order_control(placedb, hard_names, grid=224, n_evals=12, soft_iters=8,
-                         seed=0, verbose=True):
+                         seed=0, verbose=True, legal=False, refine=2):
     """Hill-climb the hard order by random block moves; score = full-932 HPWL.
 
     Starts from the strong (connectivity/topology) order = identity and keeps any
     block perturbation that lowers full-932 HPWL. This is the fair 'is the LLM
     beating dumb search?' control, mirroring strong_search.random_restart_search.
+
+    legal=True scores on the zero-overlap LEGAL layout, so this is the no-LLM control
+    for the LLM-guided legal placement.
     """
     n = len(hard_names)
     rng = random.Random(seed)
     best = list(range(n))
-    best_hpwl, best_env = two_stage_hpwl(placedb, hard_names, grid, soft_iters)
+    best_hpwl, best_env = _score_order(placedb, hard_names, grid, soft_iters, legal, refine)
     curve = [best_hpwl]
     if verbose:
         print(f"random-control start (strong order): full932 HPWL={best_hpwl:.4e}")
     for it in range(1, n_evals + 1):
         cand = perturb(best, rng)
-        h, env = two_stage_hpwl(placedb, [hard_names[i] for i in cand], grid, soft_iters)
+        h, env = _score_order(placedb, [hard_names[i] for i in cand], grid, soft_iters,
+                              legal, refine)
         keep = h < best_hpwl
         if keep:
             best, best_hpwl, best_env = cand, h, env
@@ -361,21 +365,36 @@ def _build_prompt_context(placedb, hard_names, top_k_conn=30, top_k_links=40):
     return summary, links
 
 
+def _score_order(placedb, order_names, grid, soft_iters, legal, refine):
+    """Score one hard order. legal=True -> zero-overlap LEGAL bbox HPWL (the real,
+    MaskPlace-comparable number); legal=False -> the fast OVERLAPPING proxy. Returns
+    (hpwl, env), where env is the (legalized, if legal) layout."""
+    if legal:
+        bbox, _mst, env, _ratio_f, _n = two_stage_legal_hpwl(
+            placedb, order_names, grid=grid, soft_iters=soft_iters, refine=refine)
+        return bbox, env
+    return two_stage_hpwl(placedb, order_names, grid, soft_iters)
+
+
 def _llm_search(placedb, hard_names, advisor, complete_fn, grid=224, soft_iters=8,
                 max_iters=8, patience=3, links=None, init_anchor=None, verbose=True,
-                what="order"):
+                what="order", legal=False, refine=2):
     """Shared best-anchored, accept-if-improves loop scored on full-932 HPWL.
 
     complete_fn(proposed_ids, n) -> a full permutation (0..n-1) used for scoring.
     init_anchor is the starting "best" value shown to the model (full perm for the
     full-order search, short prefix [] for the prefix search). The strong baseline
     (iter 0) is always the identity hard order, so the result never regresses.
+
+    legal=True scores each candidate on the LEGAL (zero-overlap, in-canvas) layout
+    via two_stage_legal_hpwl, so best_perm/best_env are a real legal placement of all
+    932 macros -- the LLM-guided result that is directly comparable to MaskPlace.
     """
     n = len(hard_names)
     id_of = {name: i for i, name in enumerate(hard_names)}
 
     best_perm = list(range(n))                       # identity = strong order
-    best_hpwl, best_env = two_stage_hpwl(placedb, hard_names, grid, soft_iters)
+    best_hpwl, best_env = _score_order(placedb, hard_names, grid, soft_iters, legal, refine)
     anchor = list(range(n)) if init_anchor is None else list(init_anchor)
     curve = [best_hpwl]
     if verbose:
@@ -416,7 +435,8 @@ def _llm_search(placedb, hard_names, advisor, complete_fn, grid=224, soft_iters=
                 break
             continue
         tried.add(key)
-        h, env = two_stage_hpwl(placedb, [hard_names[i] for i in perm], grid, soft_iters)
+        h, env = _score_order(placedb, [hard_names[i] for i in perm], grid, soft_iters,
+                              legal, refine)
         accepted = h < best_hpwl
         if accepted:
             best_perm, best_hpwl, best_env, no_improve = perm, h, env, 0
@@ -440,8 +460,12 @@ def _llm_search(placedb, hard_names, advisor, complete_fn, grid=224, soft_iters=
 
 
 def llm_full_order_search(placedb, hard_names, grid=224, model="claude-sonnet-4-6",
-                          max_iters=8, patience=3, soft_iters=8, verbose=True):
-    """LLM proposes a FULL order of all 133 hard macros; scored on full-932 HPWL."""
+                          max_iters=8, patience=3, soft_iters=8, verbose=True,
+                          legal=False, refine=2):
+    """LLM proposes a FULL order of all 133 hard macros; scored on full-932 HPWL.
+
+    legal=True scores on the zero-overlap LEGAL layout, so the returned best_perm/
+    best_env are a real legal 932-macro placement comparable to MaskPlace."""
     n = len(hard_names)
     summary, links = _build_prompt_context(placedb, hard_names)
     advisor = OrderingAdvisor(summary, n, model=model)
@@ -454,13 +478,16 @@ def llm_full_order_search(placedb, hard_names, grid=224, model="claude-sonnet-4-
     return _llm_search(placedb, hard_names, advisor, complete_fn, grid=grid,
                        soft_iters=soft_iters, max_iters=max_iters, patience=patience,
                        links=links, init_anchor=list(range(n)), verbose=verbose,
-                       what="order")
+                       what="order", legal=legal, refine=refine)
 
 
 def llm_prefix_search(placedb, hard_names, grid=224, model="claude-sonnet-4-6",
-                      max_iters=8, patience=3, k=50, soft_iters=8, verbose=True):
+                      max_iters=8, patience=3, k=50, soft_iters=8, verbose=True,
+                      legal=False, refine=2):
     """LLM proposes a short PRIORITY PREFIX of hub macros; the rest keep the strong
-    baseline order. Scored on full-932 HPWL. Far fewer output tokens than full-order."""
+    baseline order. Scored on full-932 HPWL. Far fewer output tokens than full-order.
+
+    legal=True scores on the zero-overlap LEGAL layout (see llm_full_order_search)."""
     n = len(hard_names)
     summary, links = _build_prompt_context(placedb, hard_names)
     advisor = PrefixAdvisor(summary, n, model=model, k=k)
@@ -472,4 +499,5 @@ def llm_prefix_search(placedb, hard_names, grid=224, model="claude-sonnet-4-6",
 
     return _llm_search(placedb, hard_names, advisor, complete_fn, grid=grid,
                        soft_iters=soft_iters, max_iters=max_iters, patience=patience,
-                       links=links, init_anchor=[], verbose=verbose, what="prefix")
+                       links=links, init_anchor=[], verbose=verbose, what="prefix",
+                       legal=legal, refine=refine)
