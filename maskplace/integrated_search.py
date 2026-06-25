@@ -101,6 +101,17 @@ def overlaps_and_oob(env, grid):
     return ov, oob
 
 
+def mst_of(placedb, env):
+    """Minimum-spanning-tree wirelength of a placed env -- comp_res's SECOND return value.
+
+    The searches optimize/report bbox HPWL (comp_res's first value); this reports the MST
+    estimate (its second value), which is the metric MaskPlace's paper Table 2 uses, so the
+    two can be compared apples-to-apples. MST >= bbox HPWL for the same layout.
+    """
+    from comp_res import comp_res
+    return comp_res(placedb, env.node_pos, env.ratio)[1]
+
+
 # --------------------------------------------------------------------------- #
 # searches over the hub order (all scored on the legal full-932 layout)
 # --------------------------------------------------------------------------- #
@@ -475,7 +486,8 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
     def row(method, res, calls=0, in_tok=0, out_tok=0, cache_tok=0):
         ov, oob = overlaps_and_oob(res["best_env"], grid)
         from trade_off_eval import usd_cost
-        return {"method": method, "hpwl": res["hpwl"], "overlaps": ov, "out_of_canvas": oob,
+        return {"method": method, "hpwl": res["hpwl"], "mst": mst_of(placedb, res["best_env"]),
+                "overlaps": ov, "out_of_canvas": oob,
                 "macros": len(res["best_env"].node_pos), "grid": grid, "calls": calls,
                 "in_tokens": in_tok, "out_tokens": out_tok,
                 "usd": usd_cost(model, in_tok, out_tok, cache_tok) if calls else 0.0}
@@ -498,23 +510,28 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
         rows.append(row(f"LLM {llm_action}", r, calls=r["calls"], in_tok=r["in_tokens"],
                         out_tok=r["out_tokens"], cache_tok=r["cache_read_tokens"]))
 
-    rows.append({"method": "MaskPlace RL (paper)", "hpwl": MASKPLACE_ARIANE_MST, "overlaps": 0,
-                 "out_of_canvas": 0, "macros": 932, "grid": 224, "calls": 0,
+    # MaskPlace reports MST (Table 2); it does not report bbox HPWL, so hpwl is None and its
+    # number goes in the MST column -> compare MST-to-MST with our rows.
+    rows.append({"method": "MaskPlace RL (paper)", "hpwl": None, "mst": MASKPLACE_ARIANE_MST,
+                 "overlaps": 0, "out_of_canvas": 0, "macros": 932, "grid": 224, "calls": 0,
                  "in_tokens": 0, "out_tokens": 0, "usd": None})
     return rows
 
 
 def print_integrated(rows):
-    """Pretty-print the integrated comparison (all legal full-932)."""
-    print("\n=== INTEGRATED LEGAL full-932 placement (LLM-guided hub order) ===")
-    hdr = (f"{'method':<22}{'HPWL':>12}{'macros':>8}{'overlaps':>9}{'oob':>5}"
-           f"{'grid':>6}{'$':>8}{'calls':>7}")
+    """Pretty-print the integrated comparison (all legal full-932). HPWL = bounding box;
+    MST = spanning-tree (the paper's metric). Compare MST-to-MST with the MaskPlace row."""
+    def fmt(v):
+        return f"{v:.3e}" if v not in (None, INF) else "-"
+    print("\n=== INTEGRATED LEGAL full-932 placement ===")
+    hdr = (f"{'method':<22}{'HPWL(bbox)':>12}{'MST':>12}{'macros':>8}{'overlaps':>9}"
+           f"{'oob':>5}{'grid':>6}{'$':>8}{'calls':>7}")
     print(hdr); print("-" * len(hdr))
     for r in rows:
         usd = f"{r['usd']:.3f}" if r.get("usd") is not None else "-"
-        hpwl = f"{r['hpwl']:.3e}" if r.get("hpwl") not in (None, INF) else "inf/-"
-        print(f"{r['method']:<22}{hpwl:>12}{str(r['macros']):>8}{str(r['overlaps']):>9}"
-              f"{str(r['out_of_canvas']):>5}{str(r['grid']):>6}{usd:>8}{str(r['calls']):>7}")
-    print("\nMaskPlace row is the paper's MST wirelength (grid 224, legal). Training-free rows"
-          "\nare legal-by-construction at grid 448; judge the LLM by whether it beats BOTH the"
+        print(f"{r['method']:<22}{fmt(r.get('hpwl')):>12}{fmt(r.get('mst')):>12}"
+              f"{str(r['macros']):>8}{str(r['overlaps']):>9}{str(r['out_of_canvas']):>5}"
+              f"{str(r['grid']):>6}{usd:>8}{str(r['calls']):>7}")
+    print("\nCompare the MST column to MaskPlace (its number is MST, grid 224). Our rows are"
+          "\nlegal-by-construction at grid 448; judge the LLM by whether it beats BOTH the"
           "\nheuristic baseline and the random control.")
