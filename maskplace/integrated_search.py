@@ -108,6 +108,56 @@ def overlaps_and_oob(env, grid):
     return ov, oob
 
 
+def plot_placement(placedb, env, grid=448, path=None, title=None, highlight=None, show=True):
+    """Draw a legal placement: every macro is a rectangle (hard SRAM = red, soft Grp_* = blue).
+
+    env.node_pos is {name: (x, y, sx, sy)} in grid cells. Optionally pass ``highlight`` -- a
+    list of macro names (e.g. a far-apart connected pair) -- to outline them in yellow and
+    draw a line between their centers. Saves a PNG if ``path`` is given and returns the figure.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, Patch
+
+    is_hard = lambda n: bool(placedb.node_info[n].get("is_hard"))
+    hi = set(highlight or [])
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for name, (x, y, sx, sy) in env.node_pos.items():
+        color = "#c0392b" if is_hard(name) else "#5a8fc0"
+        ax.add_patch(Rectangle((x, y), sx, sy, facecolor=color, edgecolor="white",
+                               linewidth=0.15, alpha=0.85))
+    for name in hi:
+        if name in env.node_pos:
+            x, y, sx, sy = env.node_pos[name]
+            ax.add_patch(Rectangle((x, y), sx, sy, facecolor="none", edgecolor="gold",
+                                   linewidth=2.0))
+    if len(hi) >= 2:
+        cents = [(x + sx / 2, y + sy / 2) for n in hi if n in env.node_pos
+                 for (x, y, sx, sy) in [env.node_pos[n]]]
+        for i in range(len(cents) - 1):
+            ax.plot([cents[i][0], cents[i + 1][0]], [cents[i][1], cents[i + 1][1]],
+                    color="gold", linewidth=1.5)
+
+    ax.set_xlim(0, grid)
+    ax.set_ylim(0, grid)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title or f"Legal placement: {len(env.node_pos)} macros @ grid {grid}")
+    ax.legend(handles=[Patch(facecolor="#c0392b", label="hard (SRAM)"),
+                       Patch(facecolor="#5a8fc0", label="soft (Grp_*)")],
+              loc="upper right", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        print("saved", path)
+    if show:
+        try:
+            plt.show()
+        except Exception:
+            pass
+    return fig
+
+
 def mst_of(placedb, env):
     """Minimum-spanning-tree wirelength of a placed env -- comp_res's SECOND return value.
 
