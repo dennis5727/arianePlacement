@@ -51,8 +51,15 @@ def hub_names(placedb, top_n, by="degree"):
 
 
 def topology_all(placedb):
-    """Frontier-growth topology order of ALL 932 macros (the heuristic baseline order)."""
-    return list(placedb.node_id_to_name)
+    """DETERMINISTIC frontier-growth topology order of ALL 932 macros (md5 tiebreak).
+
+    Uses strong_search.topology_order (stable) rather than placedb.node_id_to_name, whose
+    hash() tiebreak drifts run-to-run -- that drift made the baseline/floor differ between
+    runs (one run packs all 932, another strands a few -> inf), which muddied the
+    LLM-vs-random comparison. With this, every method starts from the SAME order.
+    """
+    from strong_search import topology_order
+    return topology_order(placedb)
 
 
 def integrated_greedy_hpwl(placedb, order_names, grid=448):
@@ -529,9 +536,12 @@ def print_integrated(rows):
     print(hdr); print("-" * len(hdr))
     for r in rows:
         usd = f"{r['usd']:.3f}" if r.get("usd") is not None else "-"
-        print(f"{r['method']:<22}{fmt(r.get('hpwl')):>12}{fmt(r.get('mst')):>12}"
+        inc = r["macros"] < 932 and r["method"] != "MaskPlace RL (paper)"
+        hpwl = "incompl" if inc else fmt(r.get("hpwl"))
+        mst = "incompl" if inc else fmt(r.get("mst"))
+        print(f"{r['method']:<22}{hpwl:>12}{mst:>12}"
               f"{str(r['macros']):>8}{str(r['overlaps']):>9}{str(r['out_of_canvas']):>5}"
               f"{str(r['grid']):>6}{usd:>8}{str(r['calls']):>7}")
     print("\nCompare the MST column to MaskPlace (its number is MST, grid 224). Our rows are"
-          "\nlegal-by-construction at grid 448; judge the LLM by whether it beats BOTH the"
-          "\nheuristic baseline and the random control.")
+          "\nlegal-by-construction at grid 448. 'incompl' = fewer than 932 macros placed, so its"
+          "\nHPWL is NOT comparable. Judge the LLM by whether it beats the random control.")
