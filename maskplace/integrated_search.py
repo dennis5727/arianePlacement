@@ -109,7 +109,11 @@ def overlaps_and_oob(env, grid):
 
 
 def plot_placement(placedb, env, grid=448, path=None, title=None, highlight=None, show=True):
-    """Draw a legal placement: every macro is a rectangle (hard SRAM = red, soft Grp_* = blue).
+    """Draw a legal placement: every macro is a rectangle.
+
+    For designs that tag hard macros (ariane: hard SRAM = red, soft Grp_* = blue) the two
+    classes are colored separately; for benchmarks without an ``is_hard`` field (e.g. adaptec1,
+    where all 543 are just "macros") every macro is drawn in one color.
 
     env.node_pos is {name: (x, y, sx, sy)} in grid cells. Optionally pass ``highlight`` -- a
     list of macro names (e.g. a far-apart connected pair) -- to outline them in yellow and
@@ -119,10 +123,11 @@ def plot_placement(placedb, env, grid=448, path=None, title=None, highlight=None
     from matplotlib.patches import Rectangle, Patch
 
     is_hard = lambda n: bool(placedb.node_info[n].get("is_hard"))
+    has_hard = any(is_hard(n) for n in env.node_pos)   # adaptec1 has none -> single color
     hi = set(highlight or [])
     fig, ax = plt.subplots(figsize=(8, 8))
     for name, (x, y, sx, sy) in env.node_pos.items():
-        color = "#c0392b" if is_hard(name) else "#5a8fc0"
+        color = ("#c0392b" if is_hard(name) else "#5a8fc0") if has_hard else "#5a8fc0"
         ax.add_patch(Rectangle((x, y), sx, sy, facecolor=color, edgecolor="white",
                                linewidth=0.15, alpha=0.85))
     for name in hi:
@@ -143,9 +148,10 @@ def plot_placement(placedb, env, grid=448, path=None, title=None, highlight=None
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_title(title or f"Legal placement: {len(env.node_pos)} macros @ grid {grid}")
-    ax.legend(handles=[Patch(facecolor="#c0392b", label="hard (SRAM)"),
-                       Patch(facecolor="#5a8fc0", label="soft (Grp_*)")],
-              loc="upper right", fontsize=8, framealpha=0.9)
+    handles = ([Patch(facecolor="#c0392b", label="hard (SRAM)"),
+                Patch(facecolor="#5a8fc0", label="soft (Grp_*)")] if has_hard
+               else [Patch(facecolor="#5a8fc0", label="macro")])
+    ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
     fig.tight_layout()
     if path:
         fig.savefig(path, dpi=120, bbox_inches="tight")
@@ -536,15 +542,22 @@ def llm_promote_search(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
 # --------------------------------------------------------------------------- #
 # end-to-end comparison
 # --------------------------------------------------------------------------- #
-# MaskPlace paper reference (arXiv 2211.13382), ariane, grid 224, legal (0.00% overlap).
-MASKPLACE_ARIANE_MST = 1.463e6
+# MaskPlace paper reference (arXiv 2211.13382), Table 2, MST wirelength, grid 224, legal
+# (0.00% overlap), MACRO-ONLY ("to place all macros"). Per-benchmark so the integrated harness
+# works on any design; values are the paper's Table-2 numbers (x10^5).
+MASKPLACE_REF = {
+    "ariane":   1.463e6,   # all 932 nodes are macros (799 soft pre-clustered) -> whole design
+    "adaptec1": 0.638e6,   # 543 macros only; std cells are NOT placed here (that's Table 6 + DREAMPlace)
+}
+# Backward-compatible alias (older callers import this name directly).
+MASKPLACE_ARIANE_MST = MASKPLACE_REF["ariane"]
 
 
 def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
                         max_iters=8, patience=3, n_random=12, n_moves=8, run_llm=True,
-                        llm_action="promote", verbose=True):
+                        llm_action="promote", benchmark="ariane", verbose=True):
     """Run heuristic baseline + matched random control (+ LLM search), all on the integrated
-    LEGAL full-932 layout. Returns rows; each carries a legality check.
+    LEGAL layout. Returns rows; each carries a legality check.
 
     llm_action="promote" (recommended, option C): the LLM makes targeted 'place A before B'
     moves on the topology order. llm_action="hub": the LLM reorders the top-N hubs to the
@@ -553,7 +566,12 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
 
     n_moves: max targeted moves per step for the promote action (LLM and matched random
     control both use it), so the LLM is compared against a random control of equal step size.
+
+    benchmark: selects the MaskPlace Table-2 reference row (MASKPLACE_REF), e.g. "ariane"
+    (1.463e6, whole 932 design) or "adaptec1" (0.638e6, 543 macros only). All our rows are
+    legal-by-construction; the reference is macro-only MST at grid 224.
     """
+    n_total = len(placedb.node_info)
     rows = []
 
     def row(method, res, calls=0, in_tok=0, out_tok=0, cache_tok=0):
@@ -561,8 +579,8 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
         from trade_off_eval import usd_cost
         return {"method": method, "hpwl": res["hpwl"], "mst": mst_of(placedb, res["best_env"]),
                 "overlaps": ov, "out_of_canvas": oob,
-                "macros": len(res["best_env"].node_pos), "grid": grid, "calls": calls,
-                "in_tokens": in_tok, "out_tokens": out_tok,
+                "macros": len(res["best_env"].node_pos), "n_total": n_total, "grid": grid,
+                "calls": calls, "in_tokens": in_tok, "out_tokens": out_tok,
                 "usd": usd_cost(model, in_tok, out_tok, cache_tok) if calls else 0.0}
 
     rows.append(row("heuristic baseline", heuristic_baseline(placedb, grid, verbose)))
@@ -589,9 +607,10 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
 
     # MaskPlace reports MST (Table 2); it does not report bbox HPWL, so hpwl is None and its
     # number goes in the MST column -> compare MST-to-MST with our rows.
-    rows.append({"method": "MaskPlace RL (paper)", "hpwl": None, "mst": MASKPLACE_ARIANE_MST,
-                 "overlaps": 0, "out_of_canvas": 0, "macros": 932, "grid": 224, "calls": 0,
-                 "in_tokens": 0, "out_tokens": 0, "usd": None})
+    rows.append({"method": "MaskPlace RL (paper)", "hpwl": None,
+                 "mst": MASKPLACE_REF.get(benchmark),
+                 "overlaps": 0, "out_of_canvas": 0, "macros": n_total, "n_total": n_total,
+                 "grid": 224, "calls": 0, "in_tokens": 0, "out_tokens": 0, "usd": None})
     return rows
 
 
@@ -600,18 +619,22 @@ def print_integrated(rows):
     MST = spanning-tree (the paper's metric). Compare MST-to-MST with the MaskPlace row."""
     def fmt(v):
         return f"{v:.3e}" if v not in (None, INF) else "-"
-    print("\n=== INTEGRATED LEGAL full-932 placement ===")
+    n_total = next((r["n_total"] for r in rows if r.get("n_total")), None)
+    tag = f"full-{n_total}" if n_total else "full"
+    print(f"\n=== INTEGRATED LEGAL {tag} placement ===")
     hdr = (f"{'method':<22}{'HPWL(bbox)':>12}{'MST':>12}{'macros':>8}{'overlaps':>9}"
            f"{'oob':>5}{'grid':>6}{'$':>8}{'calls':>7}")
     print(hdr); print("-" * len(hdr))
     for r in rows:
         usd = f"{r['usd']:.3f}" if r.get("usd") is not None else "-"
-        inc = r["macros"] < 932 and r["method"] != "MaskPlace RL (paper)"
+        inc = (r["macros"] < r.get("n_total", r["macros"])
+               and r["method"] != "MaskPlace RL (paper)")
         hpwl = "incompl" if inc else fmt(r.get("hpwl"))
         mst = "incompl" if inc else fmt(r.get("mst"))
         print(f"{r['method']:<22}{hpwl:>12}{mst:>12}"
               f"{str(r['macros']):>8}{str(r['overlaps']):>9}{str(r['out_of_canvas']):>5}"
               f"{str(r['grid']):>6}{usd:>8}{str(r['calls']):>7}")
     print("\nCompare the MST column to MaskPlace (its number is MST, grid 224). Our rows are"
-          "\nlegal-by-construction at grid 448. 'incompl' = fewer than 932 macros placed, so its"
-          "\nHPWL is NOT comparable. Judge the LLM by whether it beats the random control.")
+          "\nlegal-by-construction (zero overlap). 'incompl' = fewer than the full macro count"
+          "\nplaced, so its HPWL is NOT comparable. Judge the LLM by whether it beats the random"
+          "\ncontrol.")
