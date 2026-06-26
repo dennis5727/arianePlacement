@@ -350,7 +350,7 @@ class PromoteAdvisor:
     )
 
     def __init__(self, summary, n, model="claude-sonnet-4-6", max_tokens=1500,
-                 max_retries=2, api_key=None):
+                 max_retries=2, api_key=None, max_moves=8):
         import anthropic
         import os
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
@@ -359,6 +359,7 @@ class PromoteAdvisor:
         self.model = model
         self.max_tokens = max_tokens
         self.max_retries = max_retries
+        self.max_moves = max_moves          # how many [a,b] moves the model may propose per call
         self.calls = self.in_tokens = self.out_tokens = self.cache_read_tokens = 0
 
     def _user_msg(self, best_hpwl, history_text, feedback):
@@ -370,11 +371,13 @@ class PromoteAdvisor:
             f"{feedback}\n\n"
             "=== YOUR TASK ===\n"
             f"Current best LEGAL full-932 HPWL: {best_hpwl:.4e} (lower is better).\n"
-            "Propose 1-5 targeted moves to pull far-apart connected macros together. Each move "
-            "is a pair [a, b] meaning 'place macro a immediately before macro b in the "
-            "placement order'. Prefer moving the less-connected macro of a far-apart pair next "
-            "to the more-connected one. Do NOT repeat moves that did not help above. Think "
-            "briefly, then output ONLY a JSON list of pairs, e.g. [[12,5],[30,5]]."
+            f"Propose 1 to {self.max_moves} targeted moves to pull far-apart connected macros "
+            "together. Each move is a pair [a, b] meaning 'place macro a immediately before "
+            "macro b in the placement order'. Prefer moving the less-connected macro of a "
+            "far-apart pair next to the more-connected one. The MOVES TRIED SO FAR above list "
+            "each past attempt's exact moves and whether they helped -- do NOT repeat a move "
+            "set that was rejected; build on the ones that were accepted. Think briefly, then "
+            "output ONLY a JSON list of pairs, e.g. [[12,5],[30,5]]."
         )
 
     @staticmethod
@@ -404,7 +407,7 @@ class PromoteAdvisor:
                 self.out_tokens += getattr(u, "output_tokens", 0)
                 self.cache_read_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-                moves = self._parse_pairs(text, self.n)
+                moves = self._parse_pairs(text, self.n)[:self.max_moves]
                 if moves:
                     return moves
                 print(f"  [llm] attempt {attempt + 1}: no usable [a,b] pairs; retrying")
@@ -441,10 +444,16 @@ def random_promote_control(placedb, top_n=300, grid=448, n_evals=12, seed=0, n_m
 
 
 def llm_promote_search(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
-                       max_iters=8, patience=3, verbose=True):
-    """Option (C): the LLM proposes a few targeted 'place A before B' moves on the topology
-    order, scored on the integrated LEGAL full-932 layout, accept-if-improves, floored at
-    topology. The structure-preserving lever most likely to beat the strong baseline."""
+                       max_iters=8, patience=3, max_moves=8, verbose=True):
+    """Option (C): the LLM proposes up to ``max_moves`` targeted 'place A before B' moves on
+    the topology order, scored on the integrated LEGAL full-932 layout, accept-if-improves,
+    floored at topology. The structure-preserving lever most likely to beat the strong baseline.
+
+    Each attempt's exact moves are recorded in the history shown back to the model, so it can do
+    credit assignment (avoid repeating rejected moves, build on accepted ones) instead of seeing
+    only HPWL outcomes. max_moves widens how much the model may change per (expensive) call --
+    bigger = more exploration per call but a coarser step that is more likely rejected wholesale;
+    correctness is unaffected (the result is always floored at the topology baseline)."""
     from strong_search import long_links
     from parse_netlist import build_summary, macro_connections
     from region_constraint import REGION_LABELS
@@ -459,23 +468,27 @@ def llm_promote_search(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
     placedb.node_id_to_name = saved
     links = [(hubs[i], hubs[j], c) for i, j, c in link_pairs]
 
-    adv = PromoteAdvisor(summary, len(hubs), model=model)
+    adv = PromoteAdvisor(summary, len(hubs), model=model, max_moves=max_moves)
 
     topo = topology_all(placedb)
     best_order = topo
     best_h, best_env, npl = _score(placedb, topo, grid)
     curve = [best_h]
     if verbose:
-        print(f"iter 0 (topology floor): HPWL={best_h:.4e} placed={npl} | targeted moves over "
-              f"top {len(hubs)} hubs")
+        print(f"iter 0 (topology floor): HPWL={best_h:.4e} placed={npl} | up to {max_moves} "
+              f"targeted moves over top {len(hubs)} hubs")
 
-    attempts = [(best_h, True, "baseline")]
+    # each attempt records its EXACT moves so the model can do credit assignment, not just
+    # see HPWL go up/down. tuple: (hpwl, accepted, note, moves).
+    attempts = [(best_h, True, "baseline", None)]
     tried = {tuple(topo)}
 
     def history_text():
-        lines = [f"attempt {k}: HPWL={h:.4e} "
-                 f"({note or ('accepted, NEW BEST' if acc else 'rejected')})"
-                 for k, (h, acc, note) in enumerate(attempts)]
+        lines = []
+        for k, (h, acc, note, mv) in enumerate(attempts):
+            status = note or ("accepted, NEW BEST" if acc else "rejected")
+            mvtxt = f" moves={mv}" if mv else ""
+            lines.append(f"attempt {k}: HPWL={h:.4e} ({status}){mvtxt}")
         lines.append(f"Best so far: HPWL={best_h:.4e}")
         return "\n".join(lines)
 
@@ -491,7 +504,7 @@ def llm_promote_search(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
         key = tuple(order)
         if key in tried:
             no_improve += 1
-            attempts.append((best_h, False, "no-op / already-tried moves (skipped)"))
+            attempts.append((best_h, False, "no-op / already-tried moves (skipped)", proposed))
             if verbose:
                 print(f"iter {it:2d}: no-op or already-tried -> skipped (no_improve={no_improve})")
             if no_improve >= patience:
@@ -504,7 +517,7 @@ def llm_promote_search(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
             best_order, best_h, best_env, no_improve = order, h, env, 0
         else:
             no_improve += 1
-        attempts.append((h, accepted, ""))
+        attempts.append((h, accepted, "", proposed))
         curve.append(best_h)
         if verbose:
             tag = "ACCEPT" if accepted else ("reject" if h < INF else "reject(incomplete)")
@@ -528,7 +541,7 @@ MASKPLACE_ARIANE_MST = 1.463e6
 
 
 def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
-                        max_iters=8, patience=3, n_random=12, run_llm=True,
+                        max_iters=8, patience=3, n_random=12, n_moves=8, run_llm=True,
                         llm_action="promote", verbose=True):
     """Run heuristic baseline + matched random control (+ LLM search), all on the integrated
     LEGAL full-932 layout. Returns rows; each carries a legality check.
@@ -537,6 +550,9 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
     moves on the topology order. llm_action="hub": the LLM reorders the top-N hubs to the
     front (weaker -- hubs-first tends not to beat topology). The random control matches the
     chosen action so the comparison is fair.
+
+    n_moves: max targeted moves per step for the promote action (LLM and matched random
+    control both use it), so the LLM is compared against a random control of equal step size.
     """
     rows = []
 
@@ -553,7 +569,7 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
 
     if llm_action == "promote":
         rc = random_promote_control(placedb, top_n=top_n, grid=grid, n_evals=n_random,
-                                    verbose=verbose)
+                                    n_moves=n_moves, verbose=verbose)
         rows.append(row("random promote ctrl", rc))
     else:
         rc = random_hub_control(placedb, top_n=top_n, grid=grid, n_evals=n_random,
@@ -561,9 +577,13 @@ def evaluate_integrated(placedb, top_n=300, grid=448, model="claude-sonnet-4-6",
         rows.append(row("random hub control", rc))
 
     if run_llm:
-        search = llm_promote_search if llm_action == "promote" else llm_hub_search
-        r = search(placedb, top_n=top_n, grid=grid, model=model,
-                   max_iters=max_iters, patience=patience, verbose=verbose)
+        if llm_action == "promote":
+            r = llm_promote_search(placedb, top_n=top_n, grid=grid, model=model,
+                                   max_iters=max_iters, patience=patience,
+                                   max_moves=n_moves, verbose=verbose)
+        else:
+            r = llm_hub_search(placedb, top_n=top_n, grid=grid, model=model,
+                               max_iters=max_iters, patience=patience, verbose=verbose)
         rows.append(row(f"LLM {llm_action}", r, calls=r["calls"], in_tok=r["in_tokens"],
                         out_tok=r["out_tokens"], cache_tok=r["cache_read_tokens"]))
 
